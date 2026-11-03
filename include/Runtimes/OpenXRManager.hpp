@@ -890,6 +890,8 @@ public:
     bool GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height) const;
 
     bool IsInitialized() const { return m_initialized; }
+    // InitGraphics got as far as xrCreateSession: a second call returns false without doing anything.
+    bool HasSession() const { return m_session != XR_NULL_HANDLE; }
     bool IsSessionRunning() const { return m_sessionRunning.load(std::memory_order_relaxed); }
     // The session has the headset's input: XR_SESSION_STATE_FOCUSED (any thread).
     bool IsSessionFocused() const { return m_sessionFocused.load(std::memory_order_relaxed); }

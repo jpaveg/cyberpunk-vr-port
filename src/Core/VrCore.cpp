@@ -97,13 +97,13 @@ void WriteVrikSettingsFile() {
 // Moved to src/Core/LiveControls.cpp: polling the live-control file and the overlay UI state.
 
 extern "C" void PrepareStartupLiveControls() {
-    static bool g_dialogShown = false;
+    // Atomic: more than one swapchain path calls this, and two threads must not both open the dialog.
+    static std::atomic<bool> g_dialogShown{false};
     EnsureLiveControlFileExists();
     PollLiveControls();
     LoadLauncherConfig();
 
-    if (!g_dialogShown) {
-        g_dialogShown = true;
+    if (!g_dialogShown.exchange(true, std::memory_order_acq_rel)) {
         if (g_launcherShow) ShowLauncherDialog();
         else {
             // A pick from a ladder that has since been reshaped names a VRCAM component that no longer
