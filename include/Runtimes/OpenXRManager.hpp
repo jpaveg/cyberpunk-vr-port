@@ -892,6 +892,9 @@ public:
     bool IsInitialized() const { return m_initialized; }
     // InitGraphics got as far as xrCreateSession: a second call returns false without doing anything.
     bool HasSession() const { return m_session != XR_NULL_HANDLE; }
+    // Why the last Init() failed: 1 no instance (no OpenXR runtime, or it would not start), 2 no headset
+    // (xrGetSystem), 0 not failed. With the XrResult it failed with.
+    int GetInitFailure(XrResult* result = nullptr) const { if (result) *result = m_initFailResult; return m_initFailStage; }
     bool IsSessionRunning() const { return m_sessionRunning.load(std::memory_order_relaxed); }
     // The session has the headset's input: XR_SESSION_STATE_FOCUSED (any thread).
     bool IsSessionFocused() const { return m_sessionFocused.load(std::memory_order_relaxed); }
@@ -952,6 +955,8 @@ private:
     // The runtime's name for the headset. It was being logged and thrown away; the per-headset FOV
     // default needs it, and it is the only thing that distinguishes one panel from another at runtime.
     char m_systemName[128] = {};
+    int m_initFailStage = 0;
+    XrResult m_initFailResult = XR_SUCCESS;
     uint32_t m_eyeImageLimit[2] = {};   // GetEyeImageLimit: width, height
     XrSession m_session = XR_NULL_HANDLE;
     XrSpace m_localSpace = XR_NULL_HANDLE;

@@ -659,6 +659,8 @@ bool OpenXRManager::Init() {
     if (m_initialized) return true;
 
     Log("OpenXRManager: Initializing...\n");
+    m_initFailStage = 0;
+    m_initFailResult = XR_SUCCESS;
     ConfigurePreferredOpenXRRuntime();
 
     // Extensions we need
@@ -697,6 +699,8 @@ bool OpenXRManager::Init() {
     XrResult res = xrCreateInstance(&createInfo, &m_instance);
     if (XR_FAILED(res)) {
         Log("OpenXRManager: Failed to create XrInstance (res=%d)\n", res);
+        m_initFailStage = 1;
+        m_initFailResult = res;
         return false;
     }
 
@@ -734,6 +738,8 @@ bool OpenXRManager::Init() {
         Log("OpenXRManager: Failed to get XrSystemId (res=%d)\n", res);
         xrDestroyInstance(m_instance);
         m_instance = XR_NULL_HANDLE;
+        m_initFailStage = 2;
+        m_initFailResult = res;
         return false;
     }
 

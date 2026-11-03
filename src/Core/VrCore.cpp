@@ -2742,6 +2742,41 @@ extern "C" int GetSnapTurnYawIndex();
 
 // Moved to src/Core/WorkerThread.cpp: the background thread that does all of the polling.
 
+// NO HEADSET, NO SILENT DESKTOP LAUNCH. Without an OpenXR system the game used to boot on as a flat window with a
+// side-by-side image, no headset and no controllers -- easy to mistake for a port bug when the headset was simply
+// off, or SteamVR not running. So when Init fails, the player is asked before the game goes on: Retry (connect the
+// headset / start SteamVR first; Init is attempted again), Abort (the game closes), Ignore (it boots without VR,
+// as before). The other swapchain threads wait meanwhile (Hooks/SwapChain.cpp, RunEarlyInitOnce).
+// Returns true to try Init again.
+static bool AskAboutMissingVrSystem(int attempt) {
+    XrResult result = XR_SUCCESS;
+    const int stage = OpenXRManager::Get().GetInitFailure(&result);
+    wchar_t text[768];
+    swprintf_s(text,
+        L"%ls (OpenXR result %d, attempt %d).\n\n"
+        L"Check that the headset is connected and awake, that SteamVR (or your OpenXR runtime) is running and "
+        L"shows the headset, then press Retry.\n\n"
+        L"Abort closes the game. Ignore starts it without VR.",
+        stage == 1 ? L"No OpenXR runtime could be started"
+                   : L"No VR headset was found by the OpenXR runtime",
+        static_cast<int>(result), attempt);
+    const int choice = MessageBoxW(nullptr, text, L"cyberpunk-vr-port: no VR headset",
+        MB_ABORTRETRYIGNORE | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND);
+    if (choice == IDABORT) {
+        Log("OpenXRManager: no VR system (stage %d, res=%d) -- the player chose to close the game\n", stage,
+            static_cast<int>(result));
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+    if (choice == IDRETRY) {
+        Log("OpenXRManager: no VR system (stage %d, res=%d) -- retrying Init (attempt %d)\n", stage,
+            static_cast<int>(result), attempt + 1);
+        return true;
+    }
+    Log("OpenXRManager: no VR system (stage %d, res=%d) -- the player chose to start without VR\n", stage,
+        static_cast<int>(result));
+    return false;
+}
+
 extern "C" {
 // Initialize OpenXR early
 void InitOpenXREarly() {
@@ -2750,7 +2785,7 @@ void InitOpenXREarly() {
         return;
     }
     s_initOpenXRReentry = true;
-    OpenXRManager::Get().Init();
+    for (int attempt = 1; !OpenXRManager::Get().Init() && AskAboutMissingVrSystem(attempt); ++attempt) {}
     s_initOpenXRReentry = false;
 }
 
