@@ -1,0 +1,61 @@
+name: Windows build
+
+# Builds the RED4ext plugin (target cyberpunkvrport_stereo) with MSVC in Release and uploads the plugin folder
+# (red4ext\plugins\cyberpunkvrport: cyberpunkvrport.dll, redscript\scc_lib.dll, config\tweakdb) and the PDB.
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # redscript's scc_lib is built with cargo (CMakeLists.txt); the runner ships rustup.
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+          cargo --version
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64
+
+      - name: Build cyberpunkvrport_stereo (Release)
+        shell: pwsh
+        run: cmake --build build --config Release --target cyberpunkvrport_stereo --parallel
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          $plugin = "build/bin/red4ext/plugins/cyberpunkvrport/Release"
+          if (-not (Test-Path "$plugin/cyberpunkvrport.dll")) { Get-ChildItem -Recurse build/bin; throw "cyberpunkvrport.dll not found" }
+          New-Item -ItemType Directory -Force out/red4ext/plugins/cyberpunkvrport, out/pdb | Out-Null
+          Copy-Item -Recurse "$plugin/*" out/red4ext/plugins/cyberpunkvrport/
+          Get-ChildItem out/red4ext/plugins/cyberpunkvrport -Filter *.pdb | Move-Item -Destination out/pdb
+          Get-ChildItem -Recurse build -Filter cyberpunkvrport.pdb | Select-Object -First 1 | Copy-Item -Destination out/pdb -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse out | Select-Object FullName, Length | Format-Table -AutoSize
+          (Get-FileHash out/red4ext/plugins/cyberpunkvrport/cyberpunkvrport.dll -Algorithm SHA256).Hash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyberpunkvrport-plugin
+          path: out/red4ext
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyberpunkvrport-pdb
+          path: out/pdb
+          if-no-files-found: warn
