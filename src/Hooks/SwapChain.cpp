@@ -33,6 +33,7 @@
 #include <mutex>
 #include <atomic>
 #include <wrl.h>
+#include <intrin.h>
 
 // Defined in Stereo/CommandListCensus.cpp: hooks the game-facing command-list vtable so the port markers
 // land above a capture layer. Declared here because this is where the game-facing device is in hand.
@@ -867,6 +868,32 @@ static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
     pQueue->Release();
 }
 
+// THE GAME'S SWAPCHAINS ARE D3D12 ONES, made on a command queue. Anything else that creates a swapchain in the
+// process -- an overlay injected into the game (GOG Galaxy's overlay_mediator is), a runtime's own D3D11 device
+// (SteamVR's vrclient makes one once the session exists) -- used to be taken for the game's: its desc forced to the
+// VR size, the overlay rebound to its window, its swapchain hooked. Those now go straight to DXGI. Every call is
+// logged with the window's class and the module it came from, so the next unknown swapchain names itself.
+static bool IsGameSwapchainCall(IUnknown* pDevice, HWND hwnd, const char* what, void* caller) {
+    bool d3d12 = false;
+    ID3D12CommandQueue* queue = nullptr;
+    if (pDevice && SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) && queue) {
+        d3d12 = true;
+        queue->Release();
+    }
+    wchar_t module[MAX_PATH] = L"?";
+    HMODULE callerModule = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(caller), &callerModule) && callerModule)
+        GetModuleFileNameW(callerModule, module, MAX_PATH);
+    const wchar_t* moduleName = wcsrchr(module, L'\\');
+    moduleName = moduleName ? moduleName + 1 : module;
+    wchar_t cls[64] = {};
+    if (hwnd) GetClassNameW(hwnd, cls, 63);
+    Log("PluginBootstrap: %s hwnd=%p class=\"%S\" device=%s from %S%s\n", what, hwnd, cls,
+        d3d12 ? "D3D12 queue" : "not D3D12", moduleName, d3d12 ? "" : " -- passed through untouched");
+    return d3d12;
+}
+
 // ...and everything it did AFTER, on the swapchain that came back.
 static void PluginPostSwapchain(IDXGISwapChain* sc, HWND hwnd) {
     if (!sc || IsOurOwnWindow(hwnd)) return;
@@ -912,6 +939,9 @@ static void PluginPostSwapchain(IDXGISwapChain* sc, HWND hwnd) {
 static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChain(
         IDXGIFactory* self, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc,
         IDXGISwapChain** ppSwapChain) {
+    if (!IsGameSwapchainCall(pDevice, pDesc ? pDesc->OutputWindow : nullptr, "CreateSwapChain", _ReturnAddress())) {
+        return g_origFacCSC(self, pDevice, pDesc, ppSwapChain);
+    }
     PluginPreSwapchain(pDevice,pDesc?pDesc->OutputWindow:nullptr);
 
     DXGI_SWAP_CHAIN_DESC local{};
@@ -945,6 +975,9 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChainForHwnd(
     // Our own mirror/dummy windows go straight through: they must stay outside every path
     // built around the game's single swapchain.
     if (IsOurOwnWindow(hWnd)) {
+        return g_origFacCSCFH(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
+    }
+    if (!IsGameSwapchainCall(pDevice, hWnd, "CreateSwapChainForHwnd", _ReturnAddress())) {
         return g_origFacCSCFH(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
     }
     PluginPreSwapchain(pDevice,hWnd);
