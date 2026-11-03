@@ -33,6 +33,7 @@
 #include <mutex>
 #include <atomic>
 #include <wrl.h>
+#include <intrin.h>
 
 // Defined in Stereo/CommandListCensus.cpp: hooks the game-facing command-list vtable so the port markers
 // land above a capture layer. Declared here because this is where the game-facing device is in hand.
@@ -188,6 +189,104 @@ static bool IsOurOwnWindow(HWND hwnd) {
 
 static uint64_t PresentTicks() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return uint64_t(t.QuadPart); }
 
+// ============================================================================================
+// The XR session's D3D12 binding: InitGraphics, retried until it has actually been done
+// ============================================================================================
+//
+// InitGraphics needs the OpenXR instance (InitOpenXREarly) and returns false WITHOUT A WORD before it
+// exists. The device used to be wired exactly once, on the first swapchain call, whatever InitGraphics
+// said -- so a swapchain call that got there before the instance (a second thread while the launcher
+// held the first one) left the whole run without an XrSession: the instance up, "Initializing D3D12
+// Graphics Binding" never logged, no session state, every [xrloop] at zero frames, sessionRunning=0
+// on every Present. Now the device and queue are kept (AddRef'd) until InitGraphics has been called
+// on an initialized instance, and retried right after InitOpenXREarly and from the Present hook.
+static std::mutex g_xrGraphicsMutex;
+static ID3D12Device* g_xrPendingDevice = nullptr;        // AddRef'd while the binding is outstanding
+static ID3D12CommandQueue* g_xrPendingQueue = nullptr;
+static std::atomic<bool> g_xrGraphicsPending{false};     // the Present hook's cheap test
+static bool g_xrGraphicsSettled = false;                 // InitGraphics done, or given up on, for this run
+static int g_xrGraphicsAttempts = 0;
+static ULONGLONG g_xrGraphicsNextRetry = 0;
+static constexpr int kXrGraphicsMaxAttempts = 5;
+static constexpr ULONGLONG kXrGraphicsRetryMs = 2000;
+
+static void ReleasePendingXrGraphicsLocked() {
+    if (g_xrPendingDevice) { g_xrPendingDevice->Release(); g_xrPendingDevice = nullptr; }
+    if (g_xrPendingQueue) { g_xrPendingQueue->Release(); g_xrPendingQueue = nullptr; }
+    g_xrGraphicsPending.store(false, std::memory_order_release);
+}
+
+static void KeepPendingXrGraphicsLocked(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    if (g_xrPendingDevice != device || g_xrPendingQueue != queue) {
+        if (device) device->AddRef();
+        if (queue) queue->AddRef();
+        ReleasePendingXrGraphicsLocked();
+        g_xrPendingDevice = device;
+        g_xrPendingQueue = queue;
+    }
+    g_xrGraphicsPending.store(true, std::memory_order_release);
+}
+
+// Called with g_xrGraphicsMutex held. retry: from the pending pair, not from a swapchain call.
+static void TryXrGraphicsLocked(ID3D12Device* device, ID3D12CommandQueue* queue, const char* site, bool retry) {
+    if (g_xrGraphicsSettled || !device || !queue) return;
+    OpenXRManager& xr = OpenXRManager::Get();
+    if (xr.HasSession()) { g_xrGraphicsSettled = true; ReleasePendingXrGraphicsLocked(); return; }
+    if (!xr.IsInitialized()) {
+        if (!retry) {
+            Log("PluginBootstrap: InitGraphics skipped (%s): OpenXR is not initialized yet -- device=%p queue=%p "
+                "kept, retried once it is\n", site, device, queue);
+            KeepPendingXrGraphicsLocked(device, queue);
+        }
+        return;
+    }
+    ++g_xrGraphicsAttempts;
+    if (retry || g_xrGraphicsAttempts > 1)
+        Log("PluginBootstrap: retrying InitGraphics (%s), attempt %d of %d: device=%p queue=%p\n",
+            site, g_xrGraphicsAttempts, kXrGraphicsMaxAttempts, device, queue);
+    if (xr.InitGraphics(device, queue)) {
+        g_xrGraphicsSettled = true;
+        ReleasePendingXrGraphicsLocked();
+        return;
+    }
+    // Past xrCreateSession a second call does nothing (InitGraphics returns at once), so only a failure
+    // before the session is worth another try.
+    if (xr.HasSession() || g_xrGraphicsAttempts >= kXrGraphicsMaxAttempts) {
+        Log("PluginBootstrap: InitGraphics failed (%s) after %d attempt(s) -- no XR session this run, see the "
+            "OpenXRManager lines above\n", site, g_xrGraphicsAttempts);
+        g_xrGraphicsSettled = true;
+        ReleasePendingXrGraphicsLocked();
+        return;
+    }
+    Log("PluginBootstrap: InitGraphics failed (%s), attempt %d -- retried from Present in %llu ms\n",
+        site, g_xrGraphicsAttempts, kXrGraphicsRetryMs);
+    KeepPendingXrGraphicsLocked(device, queue);
+    g_xrGraphicsNextRetry = GetTickCount64() + kXrGraphicsRetryMs;
+}
+
+// The swapchain paths: the game-facing device and queue, the moment they are in hand.
+static void BindXrGraphics(ID3D12Device* device, ID3D12CommandQueue* queue, const char* site) {
+    std::lock_guard lock(g_xrGraphicsMutex);
+    TryXrGraphicsLocked(device, queue, site, false);
+}
+
+// Right after InitOpenXREarly, and from every Present while a binding is outstanding (one atomic load
+// otherwise). Says nothing while the instance is still missing: the skip above already said why.
+static void RetryPendingXrGraphics(const char* site) {
+    if (!g_xrGraphicsPending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(g_xrGraphicsMutex);
+    if (!g_xrPendingDevice || !g_xrPendingQueue) return;
+    if (g_xrGraphicsNextRetry && GetTickCount64() < g_xrGraphicsNextRetry) return;
+    // Hold our own references across the call: a failure path may replace the pending pair.
+    ID3D12Device* device = g_xrPendingDevice;
+    ID3D12CommandQueue* queue = g_xrPendingQueue;
+    device->AddRef();
+    queue->AddRef();
+    TryXrGraphicsLocked(device, queue, site, true);
+    queue->Release();
+    device->Release();
+}
+
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
     const uint64_t hookStart = PresentTicks();
     RememberDredDeviceFromSwapChain(swapChain);
@@ -214,6 +313,8 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
         }
     }
     cvr::gpu::queue_timeline::Present();
+    // A swapchain call that came before the OpenXR instance left the session's D3D12 binding for later.
+    RetryPendingXrGraphics("Present");
 
     {
         static uint64_t lastPresent = 0;
@@ -586,7 +687,7 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChain(IUnknown* pDevice,
         ID3D12Device* d3dDevice = nullptr;
         if (SUCCEEDED(pQueue->GetDevice(IID_PPV_ARGS(&d3dDevice)))) {
             RememberDredDevice(d3dDevice);
-            OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
+            BindXrGraphics(d3dDevice, pQueue, "DXGIFactoryWrapper::CreateSwapChain");
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
             DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
@@ -682,19 +783,65 @@ using FacCreateSwapChainForHwndFn = HRESULT (STDMETHODCALLTYPE*)(
 static FacCreateSwapChainFn        g_origFacCSC = nullptr;
 static FacCreateSwapChainForHwndFn g_origFacCSCFH = nullptr;
 
-// Everything the wrapper did BEFORE handing the call on: one-time early init, then the
-// device/queue wiring taken off the command queue the game is creating the swapchain with.
-static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
-    static std::atomic<bool> s_early{false};
-    bool expected = false;
-    if (s_early.compare_exchange_strong(expected, true)) {
+// The one-time early init, and EVERY OTHER SWAPCHAIN CALL HELD UNTIL IT IS OVER.
+//
+// It used to be a bare compare-exchange: the first caller ran the block, any other caller skipped it
+// and went straight on to wire the device. The block shows the launcher, which blocks its thread until
+// Start is clicked, and only then initializes OpenXR -- so a second swapchain call on another thread
+// meanwhile wired the device against an instance that did not exist yet (see BindXrGraphics).
+//
+// Waiting cannot deadlock on the launcher: it pumps its own messages on the thread that runs this block,
+// and only ever reaches the game window through ShowWindowAsync when that window is on another thread. The
+// waiter still dispatches messages SENT to its thread (nothing posted is touched, so the game's queue is
+// left as it was), so a cross-thread SendMessage to a window it owns cannot hang the launcher's thread
+// either. The thread running the block is never made to wait on itself.
+static void RunEarlyInitOnce(HWND hwnd) {
+    static std::atomic<int> s_state{0};               // 0 not started, 1 running, 2 done
+    static std::atomic<DWORD> s_owner{0};
+    static const HANDLE s_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    int expected = 0;
+    if (s_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        s_owner.store(GetCurrentThreadId(), std::memory_order_release);
         if(hwnd)g_gameHwnd=hwnd;
         InstallOSHooks();
         CyberpunkVRPort_EnableDredOnce();
         PrepareStartupLiveControls();
-        InitOpenXREarly();          // creates the XR instance/session; InitGraphics needs it
+        InitOpenXREarly();          // creates the XR instance; InitGraphics needs it
         FitLauncherResolutionToRuntime();   // before the swapchain below is sized from the pick
+        s_state.store(2, std::memory_order_release);
+        if (s_done) SetEvent(s_done);
+        RetryPendingXrGraphics("after InitOpenXREarly");
+        return;
     }
+    if (expected == 2) return;
+    if (s_owner.load(std::memory_order_acquire) == GetCurrentThreadId()) {
+        Log("PluginBootstrap: swapchain call re-entered the early init on its own thread -- not waiting\n");
+        return;
+    }
+    const ULONGLONG waitStart = GetTickCount64();
+    ULONGLONG nextNote = waitStart + 30000;
+    Log("PluginBootstrap: swapchain call on thread %lu waits for the launcher and OpenXR init (thread %lu)\n",
+        GetCurrentThreadId(), s_owner.load(std::memory_order_acquire));
+    while (s_state.load(std::memory_order_acquire) != 2) {
+        // 100 ms at most between looks, so the thread's windows are never taken for hung.
+        MsgWaitForMultipleObjectsEx(s_done ? 1 : 0, s_done ? &s_done : nullptr, 100, QS_SENDMESSAGE, 0);
+        MSG message{};
+        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        const ULONGLONG now = GetTickCount64();
+        if (now >= nextNote) {
+            Log("PluginBootstrap: thread %lu still waiting for the early init (%llu s)\n",
+                GetCurrentThreadId(), (now - waitStart) / 1000);
+            nextNote = now + 30000;
+        }
+    }
+    Log("PluginBootstrap: thread %lu waited %llu ms for the early init\n",
+        GetCurrentThreadId(), GetTickCount64() - waitStart);
+}
+
+// Everything the wrapper did BEFORE handing the call on: one-time early init, then the
+// device/queue wiring taken off the command queue the game is creating the swapchain with.
+static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
+    RunEarlyInitOnce(hwnd);
     ID3D12CommandQueue* pQueue = nullptr;
     if (!pDevice || FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&pQueue))) || !pQueue) return;
     ID3D12Device* d3dDevice = nullptr;
@@ -704,7 +851,8 @@ static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
         if (s_wired.compare_exchange_strong(w, true)) {
             Log("PluginBootstrap: device=%p queue=%p\n", d3dDevice, pQueue);
             RememberDredDevice(d3dDevice);
-            OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
+            // Not "wired" for XR until InitGraphics has run on an initialized instance: kept and retried.
+            BindXrGraphics(d3dDevice, pQueue, "PluginPreSwapchain");
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
             DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
@@ -718,6 +866,32 @@ static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
         d3dDevice->Release();
     }
     pQueue->Release();
+}
+
+// THE GAME'S SWAPCHAINS ARE D3D12 ONES, made on a command queue. Anything else that creates a swapchain in the
+// process -- an overlay injected into the game (GOG Galaxy's overlay_mediator is), a runtime's own D3D11 device
+// (SteamVR's vrclient makes one once the session exists) -- used to be taken for the game's: its desc forced to the
+// VR size, the overlay rebound to its window, its swapchain hooked. Those now go straight to DXGI. Every call is
+// logged with the window's class and the module it came from, so the next unknown swapchain names itself.
+static bool IsGameSwapchainCall(IUnknown* pDevice, HWND hwnd, const char* what, void* caller) {
+    bool d3d12 = false;
+    ID3D12CommandQueue* queue = nullptr;
+    if (pDevice && SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) && queue) {
+        d3d12 = true;
+        queue->Release();
+    }
+    wchar_t module[MAX_PATH] = L"?";
+    HMODULE callerModule = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(caller), &callerModule) && callerModule)
+        GetModuleFileNameW(callerModule, module, MAX_PATH);
+    const wchar_t* moduleName = wcsrchr(module, L'\\');
+    moduleName = moduleName ? moduleName + 1 : module;
+    wchar_t cls[64] = {};
+    if (hwnd) GetClassNameW(hwnd, cls, 63);
+    Log("PluginBootstrap: %s hwnd=%p class=\"%S\" device=%s from %S%s\n", what, hwnd, cls,
+        d3d12 ? "D3D12 queue" : "not D3D12", moduleName, d3d12 ? "" : " -- passed through untouched");
+    return d3d12;
 }
 
 // ...and everything it did AFTER, on the swapchain that came back.
@@ -765,6 +939,9 @@ static void PluginPostSwapchain(IDXGISwapChain* sc, HWND hwnd) {
 static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChain(
         IDXGIFactory* self, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc,
         IDXGISwapChain** ppSwapChain) {
+    if (!IsGameSwapchainCall(pDevice, pDesc ? pDesc->OutputWindow : nullptr, "CreateSwapChain", _ReturnAddress())) {
+        return g_origFacCSC(self, pDevice, pDesc, ppSwapChain);
+    }
     PluginPreSwapchain(pDevice,pDesc?pDesc->OutputWindow:nullptr);
 
     DXGI_SWAP_CHAIN_DESC local{};
@@ -798,6 +975,9 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChainForHwnd(
     // Our own mirror/dummy windows go straight through: they must stay outside every path
     // built around the game's single swapchain.
     if (IsOurOwnWindow(hWnd)) {
+        return g_origFacCSCFH(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
+    }
+    if (!IsGameSwapchainCall(pDevice, hWnd, "CreateSwapChainForHwnd", _ReturnAddress())) {
         return g_origFacCSCFH(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
     }
     PluginPreSwapchain(pDevice,hWnd);
@@ -1092,7 +1272,7 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChainForHwnd(IUnknown* p
         ID3D12Device* d3dDevice = nullptr;
         if (SUCCEEDED(pQueue->GetDevice(IID_PPV_ARGS(&d3dDevice)))) {
             RememberDredDevice(d3dDevice);
-            OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
+            BindXrGraphics(d3dDevice, pQueue, "DXGIFactoryWrapper::CreateSwapChainForHwnd");
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
             DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
