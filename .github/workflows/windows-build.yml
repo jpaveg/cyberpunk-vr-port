@@ -4,7 +4,7 @@ name: Windows build
 # (red4ext\plugins\cyberpunkvrport: cyberpunkvrport.dll, redscript\scc_lib.dll, config\tweakdb) and the PDB.
 on:
   push:
-    branches: [main, 'fix/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
